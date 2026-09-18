@@ -1,0 +1,382 @@
+<html>
+  <head>
+    <script type="text/javascript" src="https://airconsole.com/api/airconsole-1.11.0.js"></script>
+    <script type="text/javascript">
+      // Note: We manage the different div based views manually to keep the example simple.
+      // But you could use https://github.com/AirConsole/airconsole-ctrl-generator-example/blob/master/controller/libs/airconsole_view_manager.js
+      //   with the Controller Generator or your own frontend framework based approach.
+      var LOBBY = "LOBBY";
+      var GAME = "GAME";
+
+      var transitions = {
+        LOBBY: {
+          entryAction: () => {
+            if(screen === LOBBY) return;
+            document.getElementById("lobby").style.display = "block";
+            document.getElementById("game_mode").style.display = "none";
+            screen = LOBBY;
+          },
+        },
+        GAME: {
+          entryAction: () => {
+            if(screen === GAME) return;
+            document.getElementById("lobby").style.display = "none";
+            document.getElementById("game_mode").style.display = "block";
+            screen = GAME;
+          },
+        },
+      };
+
+      var airconsole;
+      var screen = LOBBY;
+      /**
+       * Sets up the communication to the screen.
+       */
+      function init() {
+        airconsole = new AirConsole({ orientation: "portrait" });
+
+        /*
+         * Checks if this device is part of the active game.
+         */
+        airconsole.onActivePlayersChange = function (player) {
+          console.info(`ActivePlayersChange [${ airconsole.device_id }]: player number`, player);
+          var div = document.getElementById("game_output");
+          if (player !== undefined) {
+            div.innerHTML = ["Left Player", "Right Player"][player];
+          } else {
+            transitions[LOBBY].entryAction();
+          }
+        };
+
+        // We lose master controller status if the current master is not hero but a hero joins the session.
+        airconsole.onConnect = function(device_id) {
+          if (airconsole.getMasterControllerDeviceId() === airconsole.device_id) {
+            configurePrimaryController();
+          } else {
+            configureAdditionalController();
+          }
+        };
+
+        // The master controller status can change when the current master leaves the session.
+        airconsole.onDisconnect = function (device_id) {
+          if (device_id === airconsole.getDeviceId()) {
+            stopMicStream();
+          }
+          if (airconsole.getMasterControllerDeviceId() === airconsole.device_id) {
+            configurePrimaryController();
+          } else {
+            configureAdditionalController();
+          }
+        };
+
+        function configureAdditionalController() {
+          if (airconsole.getDeviceId() !== airconsole.getMasterControllerDeviceId()) {
+            document.getElementById("lobby_players").style.display = "block";
+            document.getElementById("lobby_master").style.display = "none";
+            document.getElementById("wait_players").style.display = "none";
+          }
+        }
+
+        function configurePrimaryController() {
+          if (airconsole.getDeviceId() === airconsole.getMasterControllerDeviceId()) {
+            document.getElementById("lobby_players").style.display = "none";
+            document.getElementById("lobby_master").style.display = "block";
+            document.getElementById("wait_players").style.display = "block";
+          }
+        }
+
+        airconsole.onReady = function () {
+          if (!airconsole.arePlayersSilenced()) transitions[LOBBY].entryAction();
+          configurePrimaryController();
+        };
+
+        airconsole.onCustomDeviceStateChange = function (device_id, data) {
+          if(device_id === AirConsole.SCREEN) {
+            if(!!data.screen) transitions[data.screen].entryAction();
+            if (screen === LOBBY) {
+              if(data.enough_players){
+                document.getElementById("start_game").style.display = "block";
+                document.getElementById("wait_players").style.display = "none";
+              } else {
+                document.getElementById("start_game").style.display = "none";
+                const elWaitingForPlayers = document.getElementById("wait_players");
+                if (elWaitingForPlayers !== undefined) {
+                  elWaitingForPlayers.style.display = "block";
+                  elWaitingForPlayers.innerText = data.too_many_players ? 'Only 2 players can play this game' : 'Waiting for second player';
+                }
+              }
+            }
+          }
+        };
+
+        /*
+         * Makes the device vibrate if the screen says so.
+         */
+        airconsole.onMessage = function (from, data) {
+          if (from === AirConsole.SCREEN && data.vibrate) {
+            airconsole.vibrate(data.vibrate);
+            console.log("Vibrating: " + data.vibrate);
+          }
+        };
+      }
+
+      /**
+       * Tells the screen to move the paddle of this player.
+       * @param amount
+       */
+      function move(amount) {
+        airconsole.message(AirConsole.SCREEN, { move: amount });
+      }
+
+      function startGame() {
+        airconsole.message(AirConsole.SCREEN, { start_game: true });
+      }
+
+      var micStream = null;
+      var micAnimFrame = null;
+      var micAnalyser = null;
+      var micAudioContext = null;
+      var micSource = null;
+
+      function requestMic() {
+        var btn = document.getElementById('mic-btn');
+        btn.className = 'mic-btn requesting';
+        btn.disabled = true;
+
+        airconsole.getUserMedia({ audio: true }).then(function(stream) {
+          btn.className = 'mic-btn active';
+          micStream = stream;
+          micAudioContext = new AudioContext();
+          micSource = micAudioContext.createMediaStreamSource(micStream);
+          micAnalyser = micAudioContext.createAnalyser();
+          micAnalyser.fftSize = 256;
+          micSource.connect(micAnalyser);
+
+          // We reenable the button so users that later on change their mind on disallowing the microphone can reconsider the decision without restarting.
+          btn.disabled = false;
+
+          startAudioLoop();
+          showMicSuccess('Permission granted');
+        }).catch(function(error) {
+          console.error('Error while requesting microphone access:', error);
+          // Restore button state so the user can try again
+          btn.className = 'mic-btn denied';
+          btn.disabled = false;
+
+          if (error instanceof AirConsoleUserMediaError){
+            const msg = (error && (error.message || error.name)) ? (error.message || error.name) : 'Unexpected AirConsole.getUserMedia usage error';
+            showMicError(msg);
+          } else {
+            if (error.name === 'NotAllowedError') {
+              showMicError('Permission denied');
+            } else {
+              const msg = (error && (error.message || error.name)) ? (error.message || error.name) : 'Unexpected navigator.mediaDevices.getUserMedia error';
+              showMicError(msg);
+            }
+          }
+        })
+      }
+
+      function startAudioLoop() {
+        var data = new Uint8Array(micAnalyser.frequencyBinCount);
+        var lastSendTime = 0;
+        var SEND_INTERVAL_MS = 100; // 10 messages per second (rate limit is 25/s)
+        function tick() {
+          micAnimFrame = requestAnimationFrame(tick);
+          var now = Date.now();
+          if (now - lastSendTime < SEND_INTERVAL_MS) return;
+          lastSendTime = now;
+          micAnalyser.getByteFrequencyData(data);
+          var sum = 0;
+          for (var i = 0; i < data.length; i++) sum += data[i] * data[i];
+          var level = Math.sqrt(sum / data.length) / 255;
+          airconsole.message(AirConsole.SCREEN, { type: 'audio-level', level: level });
+        }
+        tick();
+      }
+
+      function stopMicStream() {
+        if (micAnimFrame) {
+          cancelAnimationFrame(micAnimFrame);
+          micAnimFrame = null;
+        }
+        if (micStream) {
+          micStream.getTracks().forEach(function(t) { t.stop(); });
+          micStream = null;
+        }
+        if (micSource) {
+          try {
+            micSource.disconnect();
+          } catch (e) {
+            console.warn('Error disconnecting mic source:', e);
+          }
+          micSource = null;
+        }
+        if (micAnalyser) {
+          try {
+            micAnalyser.disconnect();
+          } catch (e) {
+            console.warn('Error disconnecting mic analyser:', e);
+          }
+          micAnalyser = null;
+        }
+        if (micAudioContext) {
+          try {
+            var ctx = micAudioContext;
+            micAudioContext = null;
+            ctx.close().catch(function(err) {
+              console.warn('Error closing AudioContext:', err);
+            });
+          } catch (e) {
+            console.warn('Error while closing AudioContext:', e);
+            micAudioContext = null;
+          }
+        }
+      }
+
+      function showMicSuccess(msg) {
+        const elError = document.getElementById('mic-error');
+        elError.style.display = 'none';
+
+        const elSuccess = document.getElementById('mic-success');
+        elSuccess.textContent = msg;
+        elSuccess.style.display = 'block';
+        setTimeout(function() { elSuccess.style.display = 'none'; }, 3000);
+      }
+
+      function showMicError(msg) {
+        const elSuccess = document.getElementById('mic-success');
+        elSuccess.style.display = 'none';
+
+        const elError = document.getElementById('mic-error');
+        elError.textContent = msg;
+        elError.style.display = 'block';
+        setTimeout(function() { elError.style.display = 'none'; }, 3000);
+      }
+    </script>
+    <style type="text/css">
+      @font-face {
+        font-family: "PressStart2P";
+        src: url("PressStart2P.ttf") format("truetype");
+        text-align: center;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0px;
+        font-family: "PressStart2P", sans-serif;
+        color: white;
+        text-align: center;
+        background-color: black;
+      }
+
+      .button {
+        display: inline-block;
+        height: 45%;
+        width: 98%;
+        background-color: #222;
+        position: relative;
+      }
+
+      .button_label {
+        position: absolute;
+        left: 0px;
+        width: 100%;
+        top: 50%;
+        margin-top: -6px;
+      }
+
+      #game_output {
+        position: absolute;
+        top: 50%;
+        left: 0%;
+        width: 100%;
+        margin-top: -8px;
+        color: #777;
+      }
+
+      .mic-btn {
+        padding: 10px 16px;
+        font-family: 'PressStart2P', sans-serif;
+        font-size: 10px;
+        cursor: pointer;
+        background: #333;
+        color: #ccc;
+        border: 2px solid #555;
+        border-radius: 4px;
+        transition: all 0.2s;
+      }
+      .mic-btn.requesting {
+        animation: mic-pulse 0.8s ease-in-out infinite;
+        color: #fff;
+        border-color: #888;
+      }
+      .mic-btn.active {
+        background: #003300;
+        color: #00ff00;
+        border-color: #00ff00;
+        box-shadow: 0 0 12px #00ff00;
+      }
+      .mic-btn.denied {
+        background: #330000;
+        color: #ff4444;
+        border-color: #ff4444;
+        cursor: not-allowed;
+      }
+      @keyframes mic-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.4; }
+      }
+    </style>
+  </head>
+  <body onload="init()">
+    <div style="height: 1%"></div>
+
+    <div id="lobby" style="width: 100%; height: 100%; display: block">
+      <div id="lobby_players" style="margin: auto; width: 60%; height: 60%; display: none">
+        <h1>Lobby</h1>
+        <p>... Waiting for Game Master ...</p>
+      </div>
+
+      <div id="lobby_master" style="margin: auto; width: 60%; height: 60%; display: none">
+        <h1>Lobby</h1>
+        <p id="start_game"
+           style="width: 200px; height: 100px; display: none; border-color: green; border-width: 2px; border-style: solid;"
+           onclick="startGame()">
+          Click to start
+        </p>
+        <p id="wait_players" style="width: 200px; height: 100px; display: none; border-color: red; border-width: 2px; border-style: solid">
+          Waiting for more players
+        </p>
+      </div>
+    </div>
+    <div id="game_mode" style="display: none">
+      <div
+        class="button"
+        ontouchstart="move(-50)"
+        ontouchend="move(0)"
+        onmousedown="move(-50)"
+        onmouseup="move(0)"
+      >
+        <div class="button_label">UP</div>
+      </div>
+      <div style="height: 8%"></div>
+      <div
+        class="button"
+        ontouchstart="move(50)"
+        ontouchend="move(0)"
+        onmousedown="move(50)"
+        onmouseup="move(0)"
+      >
+        <div class="button_label">DOWN</div>
+      </div>
+    </div>
+    <div id="game_output">... Waiting ...</div>
+    <div id="mic-section" style="position: absolute; bottom: 5%; width: 100%; text-align: center;">
+      <button id="mic-btn" class="mic-btn" onclick="requestMic()">Enable Mic</button>
+      <div id="mic-error" style="display:none; margin-top:8px; font-size:10px; color:#ff4444; background:#1a0000; padding:6px; border-radius:4px;"></div>
+      <div id="mic-success" style="display:none; margin-top:8px; font-size:10px; color:#05fa0a; background:#1a0000; padding:6px; border-radius:4px;"></div>
+    </div>
+  </body>
+</html>
